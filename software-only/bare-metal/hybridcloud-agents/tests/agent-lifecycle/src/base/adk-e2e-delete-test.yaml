@@ -12,8 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Throwaway agent workload for end-to-end GitOps registration, Secret Manager
-# consumer key sync, and automated removal verification.
+# Throwaway agent workload for end-to-end GitOps registration, per-agent Envoy
+# SDS consumer key sync, and automated removal verification.
 apiVersion: v1
 automountServiceAccountToken: false
 kind: ServiceAccount
@@ -24,39 +24,6 @@ metadata:
     app.kubernetes.io/part-of: hybrid-cloud-agents-tests
   name: adk-e2e-delete-test
   namespace: agent-workloads
----
-apiVersion: external-secrets.io/v1
-kind: ExternalSecret
-metadata:
-  labels:
-    app.kubernetes.io/component: adk-e2e-delete-test
-    app.kubernetes.io/name: adk-e2e-delete-test
-    app.kubernetes.io/part-of: hybrid-cloud-agents-tests
-  name: e2e-delete-test-apigee-api-key
-  namespace: agent-workloads
-spec:
-  data:
-    - remoteRef:
-        key: apigee-e2e-delete-test-api-key
-      secretKey: api_key
-  refreshInterval: 15m
-  secretStoreRef:
-    kind: ClusterSecretStore
-    name: gcp-secret-manager
-  target:
-    creationPolicy: Owner
-    name: e2e-delete-test-apigee-api-key
-    template:
-      data:
-        api-key: "{{ .api_key }}"
-        sds-apigee-key.yaml: |
-          resources:
-            - "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.Secret
-              name: apigee_e2e_delete_test_api_key
-              generic_secret:
-                secret:
-                  inline_string: "{{ .api_key }}"
-      engineVersion: v2
 ---
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
@@ -73,7 +40,7 @@ spec:
       to:
         - podSelector:
             matchLabels:
-              app.kubernetes.io/component: agent-egress-proxy
+              app.kubernetes.io/component: e2e-delete-test-egress-proxy
     - ports:
         - port: 4317
           protocol: TCP
@@ -94,34 +61,25 @@ spec:
       ports:
         - port: 8080
           protocol: TCP
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: gmp-system
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              managed-by: stackdriver
+      ports:
+        - port: 8080
+          protocol: TCP
   podSelector:
     matchLabels:
       app.kubernetes.io/component: adk-e2e-delete-test
   policyTypes:
     - Ingress
     - Egress
----
-apiVersion: networking.k8s.io/v1
-kind: NetworkPolicy
-metadata:
-  labels:
-    app.kubernetes.io/part-of: hybrid-cloud-agents-tests
-  name: allow-egress-proxy-from-e2e-delete-test
-  namespace: agent-workloads
-spec:
-  ingress:
-    - from:
-        - podSelector:
-            matchLabels:
-              app.kubernetes.io/component: adk-e2e-delete-test
-      ports:
-        - port: 15001
-          protocol: TCP
-  podSelector:
-    matchLabels:
-      app.kubernetes.io/component: agent-egress-proxy
-  policyTypes:
-    - Ingress
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -156,7 +114,7 @@ spec:
             - name: ADK_CLIENT_MODE
               value: apigee_openai
             - name: EGRESS_PROXY_BASE
-              value: http://agent-egress-envoy.agent-workloads.svc.cluster.local:15001
+              value: http://e2e-delete-test-egress-envoy.agent-workloads.svc.cluster.local:15001
             - name: KSA_TOKEN_PATH
               value: /var/run/secrets/tokens/apigee-ksa/token
             - name: MODEL_ALIAS
@@ -199,9 +157,6 @@ spec:
                 - ALL
             readOnlyRootFilesystem: true
           volumeMounts:
-            - mountPath: /var/run/secrets/apigee-key
-              name: apigee-key
-              readOnly: true
             - mountPath: /var/run/secrets/tokens/apigee-ksa
               name: apigee-ksa
               readOnly: true
@@ -216,9 +171,6 @@ spec:
           type: RuntimeDefault
       serviceAccountName: adk-e2e-delete-test
       volumes:
-        - name: apigee-key
-          secret:
-            secretName: e2e-delete-test-apigee-api-key
         - name: apigee-ksa
           projected:
             defaultMode: 288
@@ -231,3 +183,23 @@ spec:
             medium: Memory
             sizeLimit: 64Mi
           name: tmp
+---
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    app.kubernetes.io/component: adk-e2e-delete-test
+    app.kubernetes.io/name: adk-e2e-delete-test
+    app.kubernetes.io/part-of: hybrid-cloud-agents-tests
+  name: adk-e2e-delete-test
+  namespace: agent-workloads
+spec:
+  ports:
+    - name: http
+      port: 8080
+      protocol: TCP
+      targetPort: http
+  selector:
+    app.kubernetes.io/component: adk-e2e-delete-test
+    app.kubernetes.io/name: adk-e2e-delete-test
+  type: ClusterIP

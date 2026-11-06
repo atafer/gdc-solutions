@@ -13,9 +13,10 @@
 # limitations under the License.
 
 # Anchor ConfigMap for the self-pruning agent-lifecycle FleetPackage so that
-# transitioning from State A (throwaway agent present) to State B (throwaway
-# agent removed) produces a valid KRM bundle while Config Sync prunes the
-# removed Deployment, ServiceAccount, NetworkPolicy, and ExternalSecret.
+# transitioning from State A (throwaway agent and dedicated egress proxy
+# present) to State B (throwaway agent and proxy removed) produces a valid KRM
+# bundle while Config Sync prunes the removed workloads, ExternalSecret, and
+# NetworkPolicies.
 apiVersion: v1
 data:
   suite: agent-lifecycle
