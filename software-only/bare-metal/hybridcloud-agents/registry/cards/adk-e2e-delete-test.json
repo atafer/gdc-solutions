@@ -25,7 +25,7 @@
     {
       "protocolBinding": "HTTP+JSON",
       "protocolVersion": "1.0",
-      "url": "https://YOUR_GATEWAY_FQDN/agents/sovereign"
+      "url": "https://YOUR_GATEWAY_FQDN/agents/e2e-delete-test"
     }
   ],
   "version": "0.2.0"
