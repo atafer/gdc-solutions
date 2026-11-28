@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<RaiseFault continueOnError="false" enabled="true" name="RaiseFault-InvalidJsonBody">
+  <DisplayName>Reject Malformed or Non-Object JSON Request Body</DisplayName>
+  <FaultResponse>
+    <Set>
+      <StatusCode>400</StatusCode>
+      <ReasonPhrase>Bad Request</ReasonPhrase>
+      <Payload contentType="application/json">{"error":{"code":400,"status":"INVALID_ARGUMENT","reason":"invalid_json_body","message":"Request body for /v1/chat/completions must be a valid JSON object."}}</Payload>
+    </Set>
+  </FaultResponse>
+  <IgnoreUnresolvedVariables>true</IgnoreUnresolvedVariables>
+</RaiseFault>

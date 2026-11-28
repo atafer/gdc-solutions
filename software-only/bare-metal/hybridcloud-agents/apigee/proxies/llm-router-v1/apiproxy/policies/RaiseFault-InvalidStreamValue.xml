@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<RaiseFault continueOnError="false" enabled="true" name="RaiseFault-InvalidStreamValue">
+  <DisplayName>Reject Non-Boolean Stream Parameter</DisplayName>
+  <FaultResponse>
+    <Set>
+      <StatusCode>400</StatusCode>
+      <ReasonPhrase>Bad Request</ReasonPhrase>
+      <Payload contentType="application/json">{"error":{"code":400,"status":"INVALID_ARGUMENT","reason":"invalid_stream_value","message":"Field 'stream' must be a JSON boolean (true or false) when present."}}</Payload>
+    </Set>
+  </FaultResponse>
+  <IgnoreUnresolvedVariables>true</IgnoreUnresolvedVariables>
+</RaiseFault>

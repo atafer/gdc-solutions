@@ -32,105 +32,121 @@ var targetTier = "local-vllm";
 var routedTierLabel = "local-vllm";
 var isSse = "false";
 var modelNotAuthorized = "false";
+var invalidJsonBody = "false";
+var invalidStreamValue = "false";
 var cloudBurstForbidden = (isCloudClass && !allowCloudBurst) ? "true" : "false";
 
-if (raw) {
+var rawStr = (raw === null || raw === undefined) ? "" : String(raw).trim();
+if (!rawStr) {
+  invalidJsonBody = "true";
+} else {
   try {
-    var body = JSON.parse(raw);
-    reqModel = String(body.model || (isCloudClass ? "enterprise-flash" : "enterprise-sovereign"));
-    context.setVariable("requested_llm_model", reqModel);
+    var body = JSON.parse(rawStr);
+    if (!body || typeof body !== "object" || Array.isArray(body)) {
+      invalidJsonBody = "true";
+    } else if (
+      Object.prototype.hasOwnProperty.call(body, "stream") &&
+      typeof body.stream !== "boolean"
+    ) {
+      invalidStreamValue = "true";
+    } else {
+      reqModel = String(body.model || (isCloudClass ? "enterprise-flash" : "enterprise-sovereign"));
+      context.setVariable("requested_llm_model", reqModel);
 
-    if (allowedCsv.trim().length > 0) {
-      var parts = allowedCsv.split(",");
-      var permitted = false;
-      for (var i = 0; i < parts.length; i++) {
-        if (parts[i].trim() === reqModel) {
-          permitted = true;
-          break;
+      if (allowedCsv.trim().length > 0) {
+        var parts = allowedCsv.split(",");
+        var permitted = false;
+        for (var i = 0; i < parts.length; i++) {
+          if (parts[i].trim() === reqModel) {
+            permitted = true;
+            break;
+          }
         }
-      }
-      if (!permitted) {
-        modelNotAuthorized = "true";
-      }
-    }
-
-    if (cloudBurstForbidden === "true") {
-      resolvedModel = aliasSovereign;
-      targetTier = "local-vllm";
-      routedTierLabel = "local-vllm";
-    } else if (reqModel === "enterprise-sovereign" || reqModel === "google/gemma-4-31B-it") {
-      // Explicit sovereign alias or local Gemma 4 requests always stay on local-vllm
-      resolvedModel = (reqModel === "enterprise-sovereign") ? aliasSovereign : reqModel;
-      targetTier = "local-vllm";
-      routedTierLabel = "local-vllm";
-    } else if (reqModel === "enterprise-flash" || (isCloudClass && reqModel === "google/gemini-3.5-flash")) {
-      if (!isCloudClass || !allowCloudBurst) {
-        if (isCloudClass && !allowCloudBurst) {
-          cloudBurstForbidden = "true";
-        } else {
+        if (!permitted) {
           modelNotAuthorized = "true";
         }
       }
-      var canarySelected = false;
-      if (canaryWeight >= 100) {
-        resolvedModel = canaryTarget;
-        canarySelected = true;
-      } else if (canaryWeight > 0 && Math.floor(Math.random() * 100) < canaryWeight) {
-        resolvedModel = canaryTarget;
-        canarySelected = true;
-      } else {
-        resolvedModel = aliasFlash;
-      }
 
-      if (resolvedModel.indexOf("google/gemini-") === 0 && isCloudClass && allowCloudBurst) {
-        targetTier = "vertex-gemini";
-        routedTierLabel = canarySelected ? "vertex-gemini-canary" : "vertex-gemini-3.5-flash";
-      } else {
-        targetTier = "local-vllm";
-        routedTierLabel = canarySelected ? "local-vllm-canary" : "local-vllm-alias-remapped";
-      }
-    } else if (!isCloudClass) {
-      resolvedModel = aliasSovereign;
-      targetTier = "local-vllm";
-      routedTierLabel = "local-vllm";
-    } else {
-      resolvedModel = reqModel;
-      if (resolvedModel.indexOf("google/gemini-") === 0) {
-        if (!allowCloudBurst) {
-          cloudBurstForbidden = "true";
-          targetTier = "local-vllm";
-          routedTierLabel = "local-vllm";
-        } else {
-          targetTier = "vertex-gemini";
-          routedTierLabel = "vertex-gemini-3.5-flash";
-        }
-      } else {
+      if (cloudBurstForbidden === "true") {
+        resolvedModel = aliasSovereign;
         targetTier = "local-vllm";
         routedTierLabel = "local-vllm";
+      } else if (reqModel === "enterprise-sovereign" || reqModel === "google/gemma-4-31B-it") {
+        // Explicit sovereign alias or local Gemma 4 requests always stay on local-vllm
+        resolvedModel = (reqModel === "enterprise-sovereign") ? aliasSovereign : reqModel;
+        targetTier = "local-vllm";
+        routedTierLabel = "local-vllm";
+      } else if (reqModel === "enterprise-flash" || (isCloudClass && reqModel === "google/gemini-3.5-flash")) {
+        if (!isCloudClass || !allowCloudBurst) {
+          if (isCloudClass && !allowCloudBurst) {
+            cloudBurstForbidden = "true";
+          } else {
+            modelNotAuthorized = "true";
+          }
+        }
+        var canarySelected = false;
+        if (canaryWeight >= 100) {
+          resolvedModel = canaryTarget;
+          canarySelected = true;
+        } else if (canaryWeight > 0 && Math.floor(Math.random() * 100) < canaryWeight) {
+          resolvedModel = canaryTarget;
+          canarySelected = true;
+        } else {
+          resolvedModel = aliasFlash;
+        }
+
+        if (resolvedModel.indexOf("google/gemini-") === 0 && isCloudClass && allowCloudBurst) {
+          targetTier = "vertex-gemini";
+          routedTierLabel = canarySelected ? "vertex-gemini-canary" : "vertex-gemini-3.5-flash";
+        } else {
+          targetTier = "local-vllm";
+          routedTierLabel = canarySelected ? "local-vllm-canary" : "local-vllm-alias-remapped";
+        }
+      } else if (!isCloudClass) {
+        resolvedModel = aliasSovereign;
+        targetTier = "local-vllm";
+        routedTierLabel = "local-vllm";
+      } else {
+        resolvedModel = reqModel;
+        if (resolvedModel.indexOf("google/gemini-") === 0) {
+          if (!allowCloudBurst) {
+            cloudBurstForbidden = "true";
+            targetTier = "local-vllm";
+            routedTierLabel = "local-vllm";
+          } else {
+            targetTier = "vertex-gemini";
+            routedTierLabel = "vertex-gemini-3.5-flash";
+          }
+        } else {
+          targetTier = "local-vllm";
+          routedTierLabel = "local-vllm";
+        }
       }
-    }
 
-    if (body.stream === true) {
-      isSse = "true";
-      if (!body.stream_options || typeof body.stream_options !== "object") {
-        body.stream_options = {};
+      if (body.stream === true) {
+        isSse = "true";
+        if (!body.stream_options || typeof body.stream_options !== "object" || Array.isArray(body.stream_options)) {
+          body.stream_options = {};
+        }
+        body.stream_options.include_usage = true;
       }
-      body.stream_options.include_usage = true;
+
+      var failoverCopy = JSON.parse(JSON.stringify(body));
+      failoverCopy.model = "google/gemma-4-31B-it";
+      failoverCopy.stream = false;
+      delete failoverCopy.stream_options;
+      context.setVariable("failover_vllm_payload", JSON.stringify(failoverCopy));
+
+      body.model = resolvedModel;
+      context.setVariable("request.content", JSON.stringify(body));
     }
-
-    var failoverCopy = JSON.parse(JSON.stringify(body));
-    failoverCopy.model = "google/gemma-4-31B-it";
-    failoverCopy.stream = false;
-    delete failoverCopy.stream_options;
-    context.setVariable("failover_vllm_payload", JSON.stringify(failoverCopy));
-
-    body.model = resolvedModel;
-    context.setVariable("request.content", JSON.stringify(body));
   } catch (e) {
-    context.setVariable("failover_vllm_payload", raw);
+    invalidJsonBody = "true";
   }
 }
 
+context.setVariable("invalid_json_body", invalidJsonBody);
+context.setVariable("invalid_stream_value", invalidStreamValue);
 context.setVariable("cloud_burst_forbidden", cloudBurstForbidden);
 context.setVariable("model_not_authorized", modelNotAuthorized);
 context.setVariable("resolved_llm_model", resolvedModel);

@@ -37,6 +37,14 @@
         <Condition>proxy.pathsuffix MatchesPath "/chat/completions"</Condition>
       </Step>
       <Step>
+        <Name>RaiseFault-InvalidJsonBody</Name>
+        <Condition>(invalid_json_body = "true") and (proxy.pathsuffix MatchesPath "/chat/completions")</Condition>
+      </Step>
+      <Step>
+        <Name>RaiseFault-InvalidStreamValue</Name>
+        <Condition>(invalid_stream_value = "true") and (proxy.pathsuffix MatchesPath "/chat/completions")</Condition>
+      </Step>
+      <Step>
         <Name>RaiseFault-CloudBurstForbidden</Name>
         <Condition>cloud_burst_forbidden = "true"</Condition>
       </Step>

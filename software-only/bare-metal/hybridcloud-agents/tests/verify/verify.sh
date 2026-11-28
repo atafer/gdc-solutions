@@ -1204,6 +1204,71 @@ PY
     record_result "S3-B6-DISPATCH-SCOPE" "Step 3 Security" "FAIL" "${detail:-${out:0:200}}"
   fi
 
+  # 9d. Security negative (RR2-1): non-boolean string stream ("true") rejected -> 400 invalid_stream_value
+  out="$(agent_call adk-sovereign-agent gateway /v1/chat/completions \
+    '{"model": "enterprise-sovereign", "messages": [{"role": "user", "content": "Count to 5."}], "stream": "true"}' \
+    "x-data-classification=sovereign" \
+    "traceparent=00-${trace_id}-3434343434343435-01" 2>&1 || true)"
+  if detail="$(python3 - "${out}" <<'PY'
+import json, sys
+d = json.loads(sys.argv[1])
+err = (d.get("body") or {}).get("error") or {}
+ok = d.get("status") == 400 and err.get("reason") == "invalid_stream_value"
+print(f"HTTP {d.get('status')} reason={err.get('reason')}")
+raise SystemExit(0 if ok else 1)
+PY
+)"; then
+    record_result "S3-STREAM-STR400" "Step 3 Security" "PASS" "${detail}"
+  else
+    record_result "S3-STREAM-STR400" "Step 3 Security" "FAIL" "${detail:-${out:0:200}}"
+  fi
+
+  # 9e. Security negative (RR2-1): non-boolean integer stream (1) rejected -> 400 invalid_stream_value
+  out="$(agent_call adk-sovereign-agent gateway /v1/chat/completions \
+    '{"model": "enterprise-sovereign", "messages": [{"role": "user", "content": "Count to 5."}], "stream": 1}' \
+    "x-data-classification=sovereign" \
+    "traceparent=00-${trace_id}-3434343434343436-01" 2>&1 || true)"
+  if detail="$(python3 - "${out}" <<'PY'
+import json, sys
+d = json.loads(sys.argv[1])
+err = (d.get("body") or {}).get("error") or {}
+ok = d.get("status") == 400 and err.get("reason") == "invalid_stream_value"
+print(f"HTTP {d.get('status')} reason={err.get('reason')}")
+raise SystemExit(0 if ok else 1)
+PY
+)"; then
+    record_result "S3-STREAM-INT400" "Step 3 Security" "PASS" "${detail}"
+  else
+    record_result "S3-STREAM-INT400" "Step 3 Security" "FAIL" "${detail:-${out:0:200}}"
+  fi
+
+  # 9f. Security negative (RR2-1): malformed JSON body rejected -> 400 (both text/plain via JS-ResolveModelAlias and application/json)
+  local bad_json_plain bad_json_ct
+  bad_json_plain="$(agent_call adk-sovereign-agent gateway /v1/chat/completions \
+    '{"model": "enterprise-sovereign", "messages": [' \
+    "Content-Type=text/plain" \
+    "x-data-classification=sovereign" \
+    "traceparent=00-${trace_id}-3434343434343437-01" 2>&1 || true)"
+  bad_json_ct="$(agent_call adk-sovereign-agent gateway /v1/chat/completions \
+    '{"model": "enterprise-sovereign", "messages": [' \
+    "x-data-classification=sovereign" \
+    "traceparent=00-${trace_id}-3434343434343438-01" 2>&1 || true)"
+  if detail="$(python3 - "${bad_json_plain}" "${bad_json_ct}" <<'PY'
+import json, sys
+dp, dj = json.loads(sys.argv[1]), json.loads(sys.argv[2])
+ep = (dp.get("body") or {}).get("error") or {}
+ej = (dj.get("body") or {}).get("error") or {}
+ok_p = dp.get("status") == 400 and ep.get("reason") == "invalid_json_body"
+ok_j = dj.get("status") == 400
+print(f"text/plain=HTTP {dp.get('status')}({ep.get('reason')}) app/json=HTTP {dj.get('status')}({ej.get('reason')})")
+raise SystemExit(0 if (ok_p and ok_j) else 1)
+PY
+)"; then
+    record_result "S3-MALFORMED-JSON" "Step 3 Security" "PASS" "${detail}"
+  else
+    record_result "S3-MALFORMED-JSON" "Step 3 Security" "FAIL" "${detail:-malformed JSON check failed}"
+  fi
+
   # 10. MCP positive (ops: tools/list + SQL + 8-dim pgvector)
   local mcp_l mcp_s mcp_v
   mcp_l="$(agent_call adk-ops-orchestrator gateway /mcp-toolbox \

@@ -53,6 +53,10 @@ in [`../model-tier/`](../model-tier/) and [`../data-tier/`](../data-tier/).
   Registry services, Apigee managed `DeveloperApp`s, `APIProduct`s,
   `agent-jwt-subjects` KVM entry keys, deployed MCP proxies, Secret Manager
   version states (metadata only), and Cloud Trace spans.
+- `test_resolve_model_alias.mjs`: Zero-dependency Node.js (`node --test`) unit
+  tests for the `llm-router-v1` `resolve_model_alias.js` Apigee policy
+  (verifying boolean `stream` validation, malformed/non-object JSON rejection,
+  alias resolution, and failover payload generation).
 
 ## Prerequisites
 
@@ -182,6 +186,9 @@ bash tests/verify/verify.sh step2 --allow-higher-stage
 | `step3`    | `S3-A2A1B`           | Step 3 #3          | Hybrid burst A2A delegation (`vertex-gemini-*` -> `local-vllm`, `SYN-POL-001`)                                        |
 | `step3`    | `S3-A2A2A`           | Step 3 #4          | Non-entitled `:15001` key calling `/a2a/sovereign` rejected (`401`, `InvalidApiKeyForGivenResource`)                  |
 | `step3`    | `S3-A2A2B`           | Step 3 #4          | Mismatched KSA JWT `sub` on `:15002` rejected (`401`, `steps.jwt.InvalidClaim`)                                       |
+| `step3`    | `S3-STREAM-STR400`   | Step 3 Security    | Non-boolean `"stream": "true"` on `/v1/chat/completions` rejected (`400`, `invalid_stream_value`)                     |
+| `step3`    | `S3-STREAM-INT400`   | Step 3 Security    | Non-boolean `"stream": 1` on `/v1/chat/completions` rejected (`400`, `invalid_stream_value`)                          |
+| `step3`    | `S3-MALFORMED-JSON`  | Step 3 Security    | Malformed JSON body rejected (`400`, `invalid_json_body` via `text/plain` and `400` via `application/json`)           |
 | `step3`    | `S3-MCP-POS`         | Step 2 #2          | Orchestrator `/mcp-toolbox` `tools/list`, SQL, and 8-dim `pgvector` all return `200` with `SYN-POL-001`               |
 | `step3`    | `S3-MCP-NEG`         | Step 3 #2          | Sovereign agent `tools/list` sees SQL only; `semantic_search` denied (`401`/`403`); `/mcp-bigquery` denied (`404`)    |
 | `step3`    | `S3-PGVECTOR-TLS`    | SRI Data Tier      | Optional (`CTX_DATA`): verifies `mcp_reader` uses `TLSv1.3` in PostgreSQL `pg_stat_ssl`                               |

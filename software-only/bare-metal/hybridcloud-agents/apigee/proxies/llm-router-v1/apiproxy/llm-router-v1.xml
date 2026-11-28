@@ -14,6 +14,8 @@
     <Policy>RaiseFault-CloudBurstForbidden</Policy>
     <Policy>KeyValueMapOperations-ReadAliases</Policy>
     <Policy>JS-ResolveModelAlias</Policy>
+    <Policy>RaiseFault-InvalidJsonBody</Policy>
+    <Policy>RaiseFault-InvalidStreamValue</Policy>
     <Policy>RaiseFault-ModelNotAuthorized</Policy>
     <Policy>RaiseFault-PromptTooLarge</Policy>
     <Policy>PromptTokenLimit-Burst</Policy>
