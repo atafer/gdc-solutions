@@ -200,8 +200,6 @@ def _record_gateway_headers(headers: dict[str, str]) -> None:
 async def _on_httpx_request(request: httpx.Request) -> None:
     if _is_sovereign_tainted():
         request.headers["x-data-classification"] = "sovereign"
-        if "x-model-tier" in request.headers:
-            del request.headers["x-model-tier"]
 
 
 async def _on_httpx_response(response: httpx.Response) -> None:
@@ -460,7 +458,6 @@ def _build_orchestrator_agent(
     enable_cloud_mcp: bool = False,
     cloud_mcp_targets: list[str] | None = None,
     enable_apigee_mcp: bool = False,
-    model_tier_hint: str = "",
     streaming: bool = False,
 ) -> tuple[Agent, list[McpToolset]]:
     if client_mode != "apigee_openai":
@@ -474,8 +471,6 @@ def _build_orchestrator_agent(
         "x-data-classification": data_classification,
         "traceparent": traceparent,
     }
-    if model_tier_hint:
-        base_headers["x-model-tier"] = model_tier_hint
 
     apigee_model = (
         requested_model
@@ -732,10 +727,6 @@ def _parse_ops_request(request: Request, payload: dict) -> dict[str, object]:
     ).strip()
     client_mode = ADK_CLIENT_MODE
 
-    model_tier_hint = (
-        request.headers.get("x-model-tier", "").strip()
-        or str(payload.get("model_tier", "")).strip()
-    )
     raw_targets = payload.get("cloud_mcp_targets")
     cloud_mcp_targets = (
         [str(t).strip().lower() for t in raw_targets]
@@ -762,7 +753,6 @@ def _parse_ops_request(request: Request, payload: dict) -> dict[str, object]:
         "enable_cloud_mcp": bool(payload.get("enable_cloud_mcp", False)),
         "cloud_mcp_targets": cloud_mcp_targets,
         "enable_apigee_mcp": bool(payload.get("enable_apigee_mcp", False)),
-        "model_tier_hint": model_tier_hint,
     }
 
 
@@ -796,7 +786,6 @@ async def invoke(request: Request) -> JSONResponse:
     enable_cloud_mcp = bool(parsed["enable_cloud_mcp"])
     cloud_mcp_targets = list(parsed["cloud_mcp_targets"])  # type: ignore[arg-type]
     enable_apigee_mcp = bool(parsed["enable_apigee_mcp"])
-    model_tier_hint = str(parsed["model_tier_hint"])
 
     turn_state = _TurnTelemetry()
     tok_state = TURN_TELEMETRY.set(turn_state)
@@ -834,7 +823,6 @@ async def invoke(request: Request) -> JSONResponse:
                 enable_cloud_mcp=enable_cloud_mcp,
                 cloud_mcp_targets=cloud_mcp_targets,
                 enable_apigee_mcp=enable_apigee_mcp,
-                model_tier_hint=model_tier_hint,
                 streaming=False,
             )
             runner = Runner(
@@ -1087,7 +1075,6 @@ async def invoke_stream(request: Request) -> StreamingResponse | JSONResponse:
     user_id = str(parsed["user_id"])
     requested_model = str(parsed["requested_model"])
     client_mode = str(parsed["client_mode"])
-    model_tier_hint = str(parsed["model_tier_hint"])
     trace_seed_hex = uuid.uuid4().hex
 
     async def _sse_generator() -> AsyncIterator[str]:
@@ -1121,7 +1108,6 @@ async def invoke_stream(request: Request) -> StreamingResponse | JSONResponse:
                     enable_toolbox_mcp=False,
                     enable_cloud_mcp=False,
                     enable_apigee_mcp=False,
-                    model_tier_hint=model_tier_hint,
                     streaming=True,
                 )
                 runner = Runner(

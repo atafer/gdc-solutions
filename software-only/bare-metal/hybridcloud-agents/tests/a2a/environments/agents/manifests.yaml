@@ -159,6 +159,7 @@ spec:
               import datetime
               import json
               from pathlib import Path
+              import socket
               import ssl
               import sys
               from cryptography import x509
@@ -166,6 +167,20 @@ spec:
               from cryptography.hazmat.primitives.asymmetric import ec
               from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
               import httpx
+
+              def classify_block(exc: BaseException) -> str:
+                cur: BaseException | None = exc
+                seen: set[int] = set()
+                while cur is not None and id(cur) not in seen:
+                  seen.add(id(cur))
+                  if isinstance(cur, ssl.SSLError):
+                    return "tls_handshake_rejected"
+                  if isinstance(cur, (httpx.ConnectTimeout, TimeoutError, socket.timeout)):
+                    return "networkpolicy_connect_timeout"
+                  cur = cur.__cause__ or cur.__context__
+                if isinstance(exc, httpx.ConnectError):
+                  return "network_connect_error"
+                return "http_transport_error"
 
               target_url = "https://agent-ingress-envoy.agent-workloads.svc.cluster.local:8443/.well-known/agent-card.json"
               ca_file = "/etc/root-ca/ca.crt"
@@ -181,7 +196,11 @@ spec:
                   bypass_succeeded = True
                   outcomes["no_client_cert"] = {"blocked": False, "status_code": resp.status_code}
               except (ssl.SSLError, httpx.HTTPError) as exc:
-                outcomes["no_client_cert"] = {"blocked": True, "error": f"{type(exc).__name__}: {exc}"}
+                outcomes["no_client_cert"] = {
+                    "blocked": True,
+                    "blocked_by": classify_block(exc),
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
 
               # Case 2: TLS 1.3 handshake with an untrusted client certificate spoofing Apigee's SAN.
               key = ec.generate_private_key(ec.SECP256R1())
@@ -229,9 +248,16 @@ spec:
                   bypass_succeeded = True
                   outcomes["spoofed_san_rogue_ca"] = {"blocked": False, "status_code": resp.status_code}
               except (ssl.SSLError, httpx.HTTPError) as exc:
-                outcomes["spoofed_san_rogue_ca"] = {"blocked": True, "error": f"{type(exc).__name__}: {exc}"}
+                outcomes["spoofed_san_rogue_ca"] = {
+                    "blocked": True,
+                    "blocked_by": classify_block(exc),
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
 
               summary = {
+                  "blocked_layers": {
+                      k: v.get("blocked_by", "unblocked") for k, v in outcomes.items()
+                  },
                   "outcomes": outcomes,
                   "target_url": target_url,
                   "test": "A2A-3b-mtls-ingress-8443-bypass-blocked",

@@ -133,7 +133,7 @@ spec:
                    ROUND((1 - (embedding <=> CAST($1 AS vector)))::numeric, 4) AS cosine_similarity
             FROM sovereign_compliance_policies
             ORDER BY embedding <=> CAST($1 AS vector)
-            LIMIT $2;
+            LIMIT LEAST(GREATEST($2, 1), 5);
           ---
           kind: toolset
           name: sovereign_governance_tools
