@@ -33,6 +33,8 @@ AVAILABLE_AGENTS_DIR="${AVAILABLE_AGENTS_DIR:-${SCRIPT_DIR}/available/agents}"
 CARDS_DIR="${CARDS_DIR:-${SCRIPT_DIR}/cards}"
 MCP_SERVERS_DIR="${MCP_SERVERS_DIR:-${SCRIPT_DIR}/mcp-servers}"
 AVAILABLE_MCP_SERVERS_DIR="${AVAILABLE_MCP_SERVERS_DIR:-${SCRIPT_DIR}/available/mcp-servers}"
+NORTHBOUND_DIR="${NORTHBOUND_DIR:-${SCRIPT_DIR}/northbound}"
+AVAILABLE_NORTHBOUND_DIR="${AVAILABLE_NORTHBOUND_DIR:-${SCRIPT_DIR}/available/northbound}"
 PROXIES_DIR="${PROXIES_DIR:-${SCRIPT_DIR}/../apigee/proxies}"
 PRODUCTS_FILE="${PRODUCTS_FILE:-${SCRIPT_DIR}/../apigee/products/api-products.json}"
 FLEET_ENV_DIR="${FLEET_ENV_DIR:-${SCRIPT_DIR}/../fleet-package/environments}"
@@ -69,6 +71,8 @@ fi
   "${CARDS_DIR}" \
   "${MCP_SERVERS_DIR}" \
   "${AVAILABLE_MCP_SERVERS_DIR}" \
+  "${NORTHBOUND_DIR}" \
+  "${AVAILABLE_NORTHBOUND_DIR}" \
   "${PROXIES_DIR}" \
   "${PRODUCTS_FILE}" \
   "${FLEET_ENV_DIR}" \
@@ -106,10 +110,12 @@ avail_agents_dir = Path(sys.argv[3])
 cards_dir = Path(sys.argv[4])
 mcp_dir = Path(sys.argv[5])
 avail_mcp_dir = Path(sys.argv[6])
-proxies_dir = Path(sys.argv[7])
-products_file = Path(sys.argv[8])
-fleet_env_dir = Path(sys.argv[9])
-tag_name = sys.argv[10]
+northbound_dir = Path(sys.argv[7])
+avail_northbound_dir = Path(sys.argv[8])
+proxies_dir = Path(sys.argv[9])
+products_file = Path(sys.argv[10])
+fleet_env_dir = Path(sys.argv[11])
+tag_name = sys.argv[12]
 
 errors: list[str] = []
 
@@ -123,6 +129,14 @@ card_files = sorted(cards_dir.glob("*.json"))
 active_mcp_files = sorted(mcp_dir.glob("*.yaml")) if mcp_dir.is_dir() else []
 staged_mcp_files = (
     sorted(avail_mcp_dir.glob("*.yaml")) if avail_mcp_dir.is_dir() else []
+)
+active_northbound_files = (
+    sorted(northbound_dir.glob("*.yaml")) if northbound_dir.is_dir() else []
+)
+staged_northbound_files = (
+    sorted(avail_northbound_dir.glob("*.yaml"))
+    if avail_northbound_dir.is_dir()
+    else []
 )
 
 seen_agent_names: dict[str, str] = {}
@@ -371,6 +385,108 @@ for p in active_mcp_files:
 for p in staged_mcp_files:
   _validate_mcp_file(p)
 
+known_product_names: set[str] = set()
+if products_file.is_file():
+  try:
+    _raw_prods = json.loads(products_file.read_text(encoding="utf-8"))
+    for _p in _raw_prods if isinstance(_raw_prods, list) else []:
+      if isinstance(_p, dict) and _p.get("name"):
+        known_product_names.add(str(_p["name"]))
+  except Exception:
+    pass
+
+seen_northbound_names: dict[str, str] = {}
+
+
+def _validate_northbound_file(nb_path: Path) -> None:
+  rel_nb = str(nb_path.relative_to(script_dir))
+  try:
+    nb_obj = load_yaml(nb_path.read_text(encoding="utf-8"))
+  except Exception as exc:
+    errors.append(f"{rel_nb}: invalid YAML: {exc}")
+    return
+  if not isinstance(nb_obj, dict):
+    errors.append(f"{rel_nb}: top-level YAML document must be a mapping")
+    return
+
+  nb_name = str(nb_obj.get("name") or "").strip()
+  if not nb_name:
+    errors.append(f"{rel_nb}: missing required 'name'")
+  elif nb_name != nb_path.stem:
+    errors.append(
+        f"{rel_nb}: 'name' ('{nb_name}') does not match filename stem '{nb_path.stem}'"
+    )
+  elif nb_name in seen_northbound_names:
+    errors.append(
+        f"{rel_nb}: duplicate northbound caller name '{nb_name}' (already defined in {seen_northbound_names[nb_name]})"
+    )
+  else:
+    seen_northbound_names[nb_name] = rel_nb
+
+  apigee_app = nb_obj.get("apigeeApp")
+  if not isinstance(apigee_app, dict):
+    errors.append(f"{rel_nb}: missing required 'apigeeApp' mapping")
+  else:
+    app_name = str(apigee_app.get("name") or "").strip()
+    if not app_name:
+      errors.append(f"{rel_nb}: missing required 'apigeeApp.name'")
+    elif app_name in seen_app_names:
+      errors.append(
+          f"{rel_nb}: duplicate apigeeApp.name '{app_name}' (already defined in {seen_app_names[app_name]})"
+      )
+    else:
+      seen_app_names[app_name] = rel_nb
+
+    dev_email = str(apigee_app.get("developerEmail") or "").strip()
+    if not dev_email or "@" not in dev_email:
+      errors.append(
+          f"{rel_nb}: missing or invalid required 'apigeeApp.developerEmail'"
+      )
+
+    if "keyVersion" in apigee_app and not str(apigee_app.get("keyVersion") or "").strip():
+      errors.append(f"{rel_nb}: 'apigeeApp.keyVersion' must be non-empty")
+
+    if "previousKeyGraceSeconds" in apigee_app:
+      grace_val = apigee_app.get("previousKeyGraceSeconds")
+      if (
+          not isinstance(grace_val, int)
+          or isinstance(grace_val, bool)
+          or not (0 <= grace_val <= 604800)
+      ):
+        errors.append(
+            f"{rel_nb}: 'apigeeApp.previousKeyGraceSeconds' must be an integer between 0 and 604800 (7 days)"
+        )
+
+  secret_id = str(nb_obj.get("secretManagerSecret") or "").strip()
+  if not secret_id:
+    errors.append(f"{rel_nb}: missing required 'secretManagerSecret'")
+  elif secret_id in seen_secrets:
+    errors.append(
+        f"{rel_nb}: duplicate secretManagerSecret '{secret_id}' (already defined in {seen_secrets[secret_id]})"
+    )
+  else:
+    seen_secrets[secret_id] = rel_nb
+
+  prods = nb_obj.get("apiProducts")
+  if not isinstance(prods, list) or not prods:
+    errors.append(f"{rel_nb}: 'apiProducts' must be a non-empty list")
+  else:
+    for idx, prod_item in enumerate(prods):
+      if not isinstance(prod_item, dict) or not str(prod_item.get("name") or "").strip():
+        errors.append(f"{rel_nb}: apiProducts[{idx}] must be a mapping with 'name'")
+        continue
+      pname = str(prod_item["name"]).strip()
+      if known_product_names and pname not in known_product_names:
+        errors.append(
+            f"{rel_nb}: apiProducts[{idx}].name '{pname}' not found in apigee/products/api-products.json"
+        )
+
+
+for p in active_northbound_files:
+  _validate_northbound_file(p)
+for p in staged_northbound_files:
+  _validate_northbound_file(p)
+
 # Verify Apigee APIProduct operationConfigs constraints and MCP tool parity
 if products_file.is_file():
   try:
@@ -581,7 +697,8 @@ if errors:
 print(
     f"Preflight manifest validation PASSED: {len(active_agent_files)} active agent(s) "
     f"({len(staged_agent_files)} staged), {len(card_files)} card(s), "
-    f"{len(active_mcp_files)} active MCP server(s) ({len(staged_mcp_files)} staged)"
+    f"{len(active_mcp_files)} active MCP server(s) ({len(staged_mcp_files)} staged), "
+    f"{len(active_northbound_files)} active northbound caller(s) ({len(staged_northbound_files)} staged)"
     f"{fleet_summary}"
     + (f", tag={tag_name}" if tag_name else "")
     + "."

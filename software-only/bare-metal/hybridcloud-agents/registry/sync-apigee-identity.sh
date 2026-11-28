@@ -38,6 +38,7 @@ AGENTS_CLUSTER_OIDC_JWKS_B64="${AGENTS_CLUSTER_OIDC_JWKS_B64:-}"
 AGENTS_DIR="${AGENTS_DIR:-${SCRIPT_DIR}/agents}"
 MCP_SERVERS_DIR="${MCP_SERVERS_DIR:-${SCRIPT_DIR}/mcp-servers}"
 AVAILABLE_MCP_SERVERS_DIR="${AVAILABLE_MCP_SERVERS_DIR:-${SCRIPT_DIR}/available/mcp-servers}"
+NORTHBOUND_DIR="${NORTHBOUND_DIR:-${SCRIPT_DIR}/northbound}"
 PRODUCTS_FILE="${PRODUCTS_FILE:-${REPO_ROOT}/apigee/products/api-products.json}"
 ENV_CONFIG_FILE="${ENV_CONFIG_FILE:-${REPO_ROOT}/apigee/environments/env-config.json}"
 
@@ -76,7 +77,8 @@ export ACCESS_TOKEN
   "${MCP_SERVERS_DIR}" \
   "${AVAILABLE_MCP_SERVERS_DIR}" \
   "${PRODUCTS_FILE}" \
-  "${ENV_CONFIG_FILE}" << 'EOF'
+  "${ENV_CONFIG_FILE}" \
+  "${NORTHBOUND_DIR}" << 'EOF'
 import base64
 import hashlib
 import json
@@ -114,6 +116,9 @@ mcp_dir = Path(sys.argv[4])
 avail_mcp_dir = Path(sys.argv[5])
 products_file = Path(sys.argv[6])
 env_config_file = Path(sys.argv[7])
+northbound_dir = (
+    Path(sys.argv[8]) if len(sys.argv) > 8 else agents_dir.parent / "northbound"
+)
 token = os.environ["ACCESS_TOKEN"]
 
 MANAGED_BY_VALUE = "hybridcloud-agents-id-sync"
@@ -448,12 +453,19 @@ base_products_list = (
 base_products = {p["name"]: p for p in base_products_list}
 env_cfg = json.loads(env_config_file.read_text(encoding="utf-8"))
 
-# Load active agent manifests
+# Load active agent manifests and active northbound caller manifests
 agent_manifests = []
 if agents_dir.is_dir():
   for manifest_path in sorted(agents_dir.glob("*/agent.yaml")):
     m = load_yaml(manifest_path.read_text(encoding="utf-8"))
     agent_manifests.append(m)
+
+northbound_manifests = []
+if northbound_dir.is_dir():
+  for manifest_path in sorted(northbound_dir.glob("*.yaml")):
+    nb = load_yaml(manifest_path.read_text(encoding="utf-8"))
+    if isinstance(nb, dict):
+      northbound_manifests.append(nb)
 
 created_count = 0
 updated_count = 0
@@ -580,6 +592,49 @@ for m in agent_manifests:
       desired_products[pname] = (des_canon, agent_name)
   agent_effective_products[agent_name] = sorted(eff_prods)
 
+northbound_effective_products: dict[str, list[str]] = {}
+for nb in northbound_manifests:
+  caller_name = str(nb["name"])
+  eff_prods = []
+  for prod_override in nb.get("apiProducts") or []:
+    pname = prod_override["name"]
+    if pname not in base_products:
+      raise RuntimeError(f"API product {pname} not found in {products_file}")
+    desired_prod = json.loads(json.dumps(base_products[pname]))
+    eff_prods.append(pname)
+    attrs = attrs_to_dict(desired_prod.get("attributes"))
+    attrs["managed_by"] = MANAGED_BY_VALUE
+    if "spikeArrestRate" in prod_override:
+      attrs["spike_arrest_rate"] = str(prod_override["spikeArrestRate"])
+    desired_prod["attributes"] = dict_to_attrs(attrs)
+    des_canon = canonical_product(desired_prod)
+    if pname in desired_products:
+      prev_canon, prev_owner = desired_products[pname]
+      if prev_canon != des_canon:
+        raise RuntimeError(
+            f"Conflicting APIProduct '{pname}' overrides between '{prev_owner}' "
+            f"and northbound caller '{caller_name}'; use identical overrides."
+        )
+    else:
+      desired_products[pname] = (des_canon, f"northbound:{caller_name}")
+  northbound_effective_products[caller_name] = sorted(eff_prods)
+
+# Ensure northbound-agent-callers exists whenever any agent is active, even if
+# no sample northbound caller manifest is active (allows custom external apps).
+if (
+    agent_manifests
+    and "northbound-agent-callers" in base_products
+    and "northbound-agent-callers" not in desired_products
+):
+  nb_prod = json.loads(json.dumps(base_products["northbound-agent-callers"]))
+  nb_attrs = attrs_to_dict(nb_prod.get("attributes"))
+  nb_attrs["managed_by"] = MANAGED_BY_VALUE
+  nb_prod["attributes"] = dict_to_attrs(nb_attrs)
+  desired_products["northbound-agent-callers"] = (
+      canonical_product(nb_prod),
+      "northbound-default",
+  )
+
 desired_product_names = set(desired_products.keys())
 for pname in sorted(desired_products.keys()):
   des_canon, _ = desired_products[pname]
@@ -654,19 +709,40 @@ for k, v in sorted(desired_static_kvm.items()):
     )
     live_kvm_entries[k] = v
 
-# 3. Reconcile Developer, Developer Apps, Secret Manager keys, and KVM entries per active agent manifest
+# 3. Reconcile Developer, Developer Apps, Secret Manager keys, and KVM entries per active agent and northbound caller
 desired_app_names = set()
 developers_checked = set()
 
+app_targets = []
 for m in agent_manifests:
-  agent_name = m["name"]
-  app_cfg = m["apigeeApp"]
+  app_targets.append({
+      "app_cfg": m["apigeeApp"],
+      "desired_prods": agent_effective_products.get(m["name"], []),
+      "entity_kind": "agent",
+      "entity_name": m["name"],
+      "expected_sub": m["kubernetesIdentity"]["expectedJwtSubject"],
+      "secret_name": m["secretManagerSecret"],
+  })
+for nb in northbound_manifests:
+  app_targets.append({
+      "app_cfg": nb["apigeeApp"],
+      "desired_prods": northbound_effective_products.get(str(nb["name"]), []),
+      "entity_kind": "northbound",
+      "entity_name": str(nb["name"]),
+      "expected_sub": None,
+      "secret_name": nb["secretManagerSecret"],
+  })
+
+for target in app_targets:
+  agent_name = target["entity_name"]
+  entity_kind = target["entity_kind"]
+  app_cfg = target["app_cfg"]
   app_name = app_cfg["name"]
   dev_email = app_cfg["developerEmail"]
   desired_app_names.add((dev_email, app_name))
-  expected_sub = m["kubernetesIdentity"]["expectedJwtSubject"]
-  secret_name = m["secretManagerSecret"]
-  desired_prods = agent_effective_products.get(agent_name, [])
+  expected_sub = target["expected_sub"]
+  secret_name = target["secret_name"]
+  desired_prods = target["desired_prods"]
 
   # Ensure developer exists
   if dev_email not in developers_checked:
@@ -716,11 +792,14 @@ for m in agent_manifests:
   base_desired_attrs = {
       "business_unit": str(app_cfg.get("businessUnit", "hybrid-agents")),
       "cost_center": str(app_cfg.get("costCenter", "CC-HYBRID-001")),
-      "expected_jwt_sub": expected_sub,
       "keySecret": secret_name,
-      "managed_agent": agent_name,
       "managed_by": MANAGED_BY_VALUE,
   }
+  if entity_kind == "agent":
+    base_desired_attrs["expected_jwt_sub"] = expected_sub
+    base_desired_attrs["managed_agent"] = agent_name
+  else:
+    base_desired_attrs["managed_caller"] = agent_name
   if desired_key_version != "v1":
     base_desired_attrs["key_version"] = desired_key_version
 
@@ -944,36 +1023,37 @@ for m in agent_manifests:
           f"remaining={remaining}s; revokes on next pipeline run after grace)"
       )
 
-  # Reconcile KVM entry in agent-jwt-subjects: app_name -> expected_sub
-  if app_name not in live_kvm_entries:
-    print(f"CREATE KVM entry {kvm_name}/{app_name} -> {expected_sub}")
-    api_req(
-        "POST",
-        f"{kvm_base}/{kvm_name}/entries",
-        {"name": app_name, "value": expected_sub},
-    )
-    live_kvm_entries[app_name] = expected_sub
-    if not app_created:
-      app_updated = True
-  elif live_kvm_entries[app_name] != expected_sub:
-    print(f"UPDATE KVM entry {kvm_name}/{app_name} -> {expected_sub}")
-    api_req(
-        "PUT",
-        f"{kvm_base}/{kvm_name}/entries/{urllib.parse.quote(app_name, safe='')}",
-        {"name": app_name, "value": expected_sub},
-    )
-    live_kvm_entries[app_name] = expected_sub
-    if not app_created:
-      app_updated = True
-  else:
-    print(f"UNCHANGED KVM entry {kvm_name}/{app_name}")
+  # Reconcile KVM entry in agent-jwt-subjects: app_name -> expected_sub (agent apps only)
+  if expected_sub:
+    if app_name not in live_kvm_entries:
+      print(f"CREATE KVM entry {kvm_name}/{app_name} -> {expected_sub}")
+      api_req(
+          "POST",
+          f"{kvm_base}/{kvm_name}/entries",
+          {"name": app_name, "value": expected_sub},
+      )
+      live_kvm_entries[app_name] = expected_sub
+      if not app_created:
+        app_updated = True
+    elif live_kvm_entries[app_name] != expected_sub:
+      print(f"UPDATE KVM entry {kvm_name}/{app_name} -> {expected_sub}")
+      api_req(
+          "PUT",
+          f"{kvm_base}/{kvm_name}/entries/{urllib.parse.quote(app_name, safe='')}",
+          {"name": app_name, "value": expected_sub},
+      )
+      live_kvm_entries[app_name] = expected_sub
+      if not app_created:
+        app_updated = True
+    else:
+      print(f"UNCHANGED KVM entry {kvm_name}/{app_name}")
 
   if app_created:
     created_count += 1
   elif app_updated:
     updated_count += 1
   else:
-    print(f"UNCHANGED Agent identity {agent_name} (app={app_name})")
+    print(f"UNCHANGED {entity_kind} identity {agent_name} (app={app_name})")
     noop_count += 1
 
 # 4. Delete pipeline-managed Developer Apps, KVM entries, and Secret Manager key versions for removed manifests.
@@ -988,7 +1068,7 @@ for dev_obj in developer_items:
   if d_email:
     all_developers.add(d_email)
 
-active_secret_names = {m["secretManagerSecret"] for m in agent_manifests}
+active_secret_names = {t["secret_name"] for t in app_targets}
 for dev_email in sorted(all_developers):
   st_apps, app_items = list_apigee_paginated(
       f"{APIGEE_BASE}/developers/{urllib.parse.quote(dev_email, safe='@.')}/apps",

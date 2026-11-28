@@ -238,6 +238,7 @@ GEMINI_COOLDOWN_SECONDS="${GEMINI_COOLDOWN_SECONDS:-65}"
 TRACE_FLUSH_SECONDS="${TRACE_FLUSH_SECONDS:-15}"
 TRACE_MIN_SPANS="${TRACE_MIN_SPANS:-20}"
 TRACE_EXPECTED_CLUSTERS="${TRACE_EXPECTED_CLUSTERS:-${AGENTS_CLUSTER}}"
+NORTHBOUND_KEY_SECRET="${NORTHBOUND_KEY_SECRET:-apigee-northbound-sample-caller-api-key}"
 KUBECTL_CACHE_DIR="${KUBECTL_CACHE_DIR:-}"
 
 if [[ "${NO_COOLDOWN}" == "true" ]]; then
@@ -1204,6 +1205,45 @@ PY
     record_result "S3-B6-DISPATCH-SCOPE" "Step 3 Security" "FAIL" "${detail:-${out:0:200}}"
   fi
 
+  # 9c-pos. Positive northbound call (RR2-2): external caller key from Secret Manager -> 200 on /agents/ops-orchestrator/invoke
+  local nb_ca_file="${ROTATE_CA_FILE}"
+  if [[ -z "${nb_ca_file}" && -n "${SOLUTION_HOME}" ]]; then
+    nb_ca_file="${SOLUTION_HOME}/hybrid-agents-root-ca.crt"
+  fi
+  if [[ -z "${nb_ca_file}" || ! -f "${nb_ca_file}" ]]; then
+    if [[ "${CHECK_WORKSTATION_TLS}" == "true" ]]; then
+      record_result "S3-NORTHBOUND-POS" "Step 3 Northbound" "FAIL" "Missing ${nb_ca_file} (set SOLUTION_HOME or pass --ca-file)"
+    else
+      record_result "S3-NORTHBOUND-POS" "Step 3 Northbound" "SKIP" "CA bundle not found at SOLUTION_HOME/hybrid-agents-root-ca.crt"
+    fi
+  elif open_gateway_transport; then
+    local nb_out nb_rc=0
+    nb_out="$(python3 "${CP_CHECK_PY}" northbound-probe \
+      --project="${PROJECT_ID}" \
+      --secret-id="${NORTHBOUND_KEY_SECRET}" \
+      --gateway-fqdn="${GATEWAY_FQDN}" \
+      --connect-host="${GW_CONNECT_HOST}" \
+      --connect-port="${GW_CONNECT_PORT}" \
+      --ca-file="${nb_ca_file}" \
+      --traceparent="00-${trace_id}-3434343434343439-01" 2>&1)" || nb_rc=$?
+    close_gateway_transport
+    detail="$(python3 - "${nb_out}" <<'PY' 2>/dev/null || true
+import json, sys
+d = json.loads(sys.argv[1])
+base = f"card={d.get('card_status')}({d.get('card_name')}) invoke={d.get('invoke_status')} backend={d.get('llm_backend')} key_sha={d.get('key_sha256')}"
+errs = d.get("errors") or []
+print(base if not errs else f"{base} | errors={'; '.join(errs)}")
+PY
+)"
+    if [[ "${nb_rc}" -eq 0 ]]; then
+      record_result "S3-NORTHBOUND-POS" "Step 3 Northbound" "PASS" "${detail:-${nb_out:0:220}}"
+    else
+      record_result "S3-NORTHBOUND-POS" "Step 3 Northbound" "FAIL" "${detail:-${nb_out:0:220}}"
+    fi
+  else
+    record_result "S3-NORTHBOUND-POS" "Step 3 Northbound" "FAIL" "Cannot reach ${GATEWAY_FQDN}:443 directly or via Connect Gateway port-forward"
+  fi
+
   # 9d. Security negative (RR2-1): non-boolean string stream ("true") rejected -> 400 invalid_stream_value
   out="$(agent_call adk-sovereign-agent gateway /v1/chat/completions \
     '{"model": "enterprise-sovereign", "messages": [{"role": "user", "content": "Count to 5."}], "stream": "true"}' \
@@ -1649,17 +1689,96 @@ PY
 }
 
 # ---------------------------------------------------------------------------
-# Subcommand: rotate (optional Day-2 key rotation grace & revocation verifier)
+# Shared gateway HTTPS transport (direct in-VPC VIP/FQDN or Connect Gateway PF)
 # ---------------------------------------------------------------------------
-ROTATE_PF_PID=""
-cleanup_rotate_pf() {
-  if [[ -n "${ROTATE_PF_PID}" ]]; then
-    kill "${ROTATE_PF_PID}" 2>/dev/null || true
-    wait "${ROTATE_PF_PID}" 2>/dev/null || true
-    ROTATE_PF_PID=""
+GW_PF_PID=""
+GW_CONNECT_HOST=""
+GW_CONNECT_PORT=443
+
+close_gateway_transport() {
+  if [[ -n "${GW_PF_PID}" ]]; then
+    kill "${GW_PF_PID}" 2>/dev/null || true
+    wait "${GW_PF_PID}" 2>/dev/null || true
+    GW_PF_PID=""
   fi
 }
 
+open_gateway_transport() {
+  close_gateway_transport
+  local direct_host="${APIGEE_INGRESS_VIP:-${GATEWAY_FQDN}}"
+  if python3 - "${direct_host}" <<'PY' 2>/dev/null
+import socket, sys
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.settimeout(2.0)
+try:
+    s.connect((sys.argv[1], 443))
+finally:
+    s.close()
+PY
+  then
+    GW_CONNECT_HOST="${direct_host}"
+    GW_CONNECT_PORT=443
+    return 0
+  fi
+
+  local ig_svc local_port
+  ig_svc="$(kubectl_ctx "${CTX_GATEWAY}" -n apigee get svc -l app=apigee-ingressgateway,ingress_name=hybrid-agents-ig -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
+  if [[ -z "${ig_svc}" ]]; then
+    ig_svc="$(kubectl_ctx "${CTX_GATEWAY}" -n apigee get svc -l app=apigee-ingressgateway -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
+  fi
+  if [[ -z "${ig_svc}" ]]; then
+    return 1
+  fi
+  local_port="$(python3 - <<'PY'
+import socket
+for port in range(18443, 18543):
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        sock.bind(("127.0.0.1", port))
+        print(port)
+        break
+    except OSError:
+        continue
+    finally:
+        sock.close()
+PY
+)"
+  if [[ -z "${local_port}" ]]; then
+    return 1
+  fi
+  trap close_gateway_transport EXIT
+  kubectl_ctx "${CTX_GATEWAY}" -n apigee port-forward "svc/${ig_svc}" "${local_port}:443" >/dev/null 2>&1 &
+  GW_PF_PID="$!"
+  local ready="false"
+  for _ in $(seq 1 30); do
+    if python3 - "${local_port}" <<'PY' 2>/dev/null
+import socket, sys
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.settimeout(0.5)
+try:
+    s.connect(("127.0.0.1", int(sys.argv[1])))
+finally:
+    s.close()
+PY
+    then
+      ready="true"
+      break
+    fi
+    sleep 0.5
+  done
+  if [[ "${ready}" != "true" ]]; then
+    close_gateway_transport
+    return 1
+  fi
+  GW_CONNECT_HOST="127.0.0.1"
+  GW_CONNECT_PORT="${local_port}"
+  echo "--- Using Connect Gateway port-forward to apigee/${ig_svc} on 127.0.0.1:${GW_CONNECT_PORT} (SNI=${GATEWAY_FQDN}) ---"
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# Subcommand: rotate (optional Day-2 key rotation grace & revocation verifier)
+# ---------------------------------------------------------------------------
 run_rotate_probe_json() {
   local app_name="$1"
   local connect_host="$2"
@@ -1776,75 +1895,12 @@ run_rotate() {
 
   echo "=== Running Day-2 key rotation checks (agent=${ROTATE_AGENT}, app=${app_name}, phase=${ROTATE_PHASE}) ==="
 
-  # Resolve HTTPS connectivity to Apigee ingress (direct VIP/FQDN or Connect Gateway port-forward)
-  local direct_host="${APIGEE_INGRESS_VIP:-${GATEWAY_FQDN}}"
-  local connect_host=""
-  local connect_port=443
-  if python3 - "${direct_host}" <<'PY' 2>/dev/null
-import socket, sys
-s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-s.settimeout(2.0)
-try:
-    s.connect((sys.argv[1], 443))
-finally:
-    s.close()
-PY
-  then
-    connect_host="${direct_host}"
-    connect_port=443
-  else
-    local ig_svc local_port
-    ig_svc="$(kubectl_ctx "${CTX_GATEWAY}" -n apigee get svc -l app=apigee-ingressgateway,ingress_name=hybrid-agents-ig -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
-    if [[ -z "${ig_svc}" ]]; then
-      ig_svc="$(kubectl_ctx "${CTX_GATEWAY}" -n apigee get svc -l app=apigee-ingressgateway -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
-    fi
-    if [[ -z "${ig_svc}" ]]; then
-      record_result "ROTATE-CONNECT" "Day-2 Rotate" "FAIL" "Cannot reach ${direct_host}:443 directly and no apigee-ingressgateway Service found in ${CTX_GATEWAY}/apigee"
-      return 0
-    fi
-    local_port="$(python3 - <<'PY'
-import socket
-for port in range(18443, 18543):
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    try:
-        sock.bind(("127.0.0.1", port))
-        print(port)
-        break
-    except OSError:
-        continue
-    finally:
-        sock.close()
-PY
-)"
-    trap cleanup_rotate_pf EXIT
-    kubectl_ctx "${CTX_GATEWAY}" -n apigee port-forward "svc/${ig_svc}" "${local_port}:443" >/dev/null 2>&1 &
-    ROTATE_PF_PID="$!"
-    local ready="false"
-    for _ in $(seq 1 30); do
-      if python3 - "${local_port}" <<'PY' 2>/dev/null
-import socket, sys
-s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-s.settimeout(0.5)
-try:
-    s.connect(("127.0.0.1", int(sys.argv[1])))
-finally:
-    s.close()
-PY
-      then
-        ready="true"
-        break
-      fi
-      sleep 0.5
-    done
-    if [[ "${ready}" != "true" ]]; then
-      cleanup_rotate_pf
-      record_result "ROTATE-CONNECT" "Day-2 Rotate" "FAIL" "Port-forward to svc/${ig_svc}:443 in ${CTX_GATEWAY}/apigee did not become ready"
-      return 0
-    fi
-    connect_host="127.0.0.1"
-    connect_port="${local_port}"
-    echo "--- Using Connect Gateway port-forward to apigee/${ig_svc} on 127.0.0.1:${connect_port} (SNI=${GATEWAY_FQDN}) ---"
+  if ! open_gateway_transport; then
+    record_result "ROTATE-CONNECT" "Day-2 Rotate" "FAIL" "Cannot reach ${APIGEE_INGRESS_VIP:-${GATEWAY_FQDN}}:443 directly or via Connect Gateway port-forward"
+    return 0
   fi
+  local connect_host="${GW_CONNECT_HOST}"
+  local connect_port="${GW_CONNECT_PORT}"
 
   local probe_out=""
   if [[ "${ROTATE_PHASE}" == "full" ]]; then
@@ -1906,11 +1962,11 @@ PY
       record_result "ROTATE-OLD-GRACE" "Day-2 Rotate" "SKIP" "N-1 key is already revoked (grace=0 or grace already elapsed)"
     elif [[ -n "${det_phase}" ]]; then
       record_rotate_phase_checks "${probe_out}" "ROTATE-NEW-KEY"
-      cleanup_rotate_pf
+      close_gateway_transport
       return 0
     else
       record_result "ROTATE-PROBE" "Day-2 Rotate" "FAIL" "${probe_out:0:240}"
-      cleanup_rotate_pf
+      close_gateway_transport
       return 0
     fi
 
@@ -1959,7 +2015,7 @@ PY
     record_result "ROTATE-ENVOY-OK" "Day-2 Rotate" "FAIL" "${envoy_detail:-${envoy_call_out:0:200}}"
   fi
 
-  cleanup_rotate_pf
+  close_gateway_transport
 }
 
 # ---------------------------------------------------------------------------

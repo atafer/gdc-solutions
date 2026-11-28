@@ -19,6 +19,7 @@ Never reads Secret Manager payloads (queries version metadata/state only).
 """
 
 import argparse
+import base64
 import hashlib
 import http.client
 import json
@@ -37,6 +38,8 @@ AGENT_KEY_SECRETS = (
     "apigee-ops-orchestrator-api-key",
     "apigee-sovereign-agent-api-key",
 )
+NORTHBOUND_KEY_SECRETS = ("apigee-northbound-sample-caller-api-key",)
+ALL_KEY_SECRETS = AGENT_KEY_SECRETS + NORTHBOUND_KEY_SECRETS
 
 
 def get_access_token() -> str:
@@ -178,7 +181,7 @@ def collect_control_plane(
 
     # 6. Secret Manager version states (metadata only; no payload access)
     sm_state: dict[str, dict] = {}
-    for secret_id in AGENT_KEY_SECRETS:
+    for secret_id in ALL_KEY_SECRETS:
         st_sec, sec_resp = api_get(
             f"https://secretmanager.googleapis.com/v1/projects/{project}/secrets/{secret_id}/versions?pageSize=200",
             token,
@@ -245,7 +248,7 @@ def evaluate_expectation(state: dict, expect: str) -> list[str]:
         for app_name in ("ops-orchestrator-app", "sovereign-agents-app"):
             if app_name in kvm_keys:
                 errors.append(f"Expected KVM entry {app_name} to be deleted")
-        for sec_id in AGENT_KEY_SECRETS:
+        for sec_id in ALL_KEY_SECRETS:
             if sm[sec_id]["enabled"] or sm[sec_id]["disabled"]:
                 errors.append(
                     f"Expected 0 enabled/disabled versions on {sec_id}, found enabled={sm[sec_id]['enabled']} disabled={sm[sec_id]['disabled']}"
@@ -726,6 +729,152 @@ def cmd_rotate_probe(args: argparse.Namespace) -> int:
     return 0 if not errors else 1
 
 
+def _https_request_with_key(
+    gateway_fqdn: str,
+    connect_host: str,
+    connect_port: int,
+    ca_file: str,
+    method: str,
+    path: str,
+    api_key: str,
+    body_obj: dict | None = None,
+    extra_headers: dict[str, str] | None = None,
+    timeout: float = 120.0,
+) -> dict:
+    ctx = ssl.create_default_context(cafile=ca_file)
+    conn = _HostnameHTTPSConnection(
+        connect_host=connect_host,
+        connect_port=connect_port,
+        server_hostname=gateway_fqdn,
+        context=ctx,
+        timeout=timeout,
+    )
+    headers = {
+        "Accept": "application/json",
+        "Host": gateway_fqdn,
+        "x-api-key": api_key,
+    }
+    if extra_headers:
+        headers.update(extra_headers)
+    payload_bytes = None
+    if body_obj is not None:
+        headers["Content-Type"] = "application/json"
+        payload_bytes = json.dumps(body_obj).encode("utf-8")
+    try:
+        conn.request(method, path, body=payload_bytes, headers=headers)
+        resp = conn.getresponse()
+        raw = resp.read().decode("utf-8", errors="replace")
+        parsed_body: object = raw[:400]
+        try:
+            parsed_body = json.loads(raw)
+        except ValueError:
+            pass
+        return {
+            "status": resp.status,
+            "body": parsed_body,
+            "error": "",
+        }
+    except Exception as exc:
+        return {
+            "status": 0,
+            "body": {},
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+    finally:
+        conn.close()
+
+
+def cmd_northbound_probe(args: argparse.Namespace) -> int:
+    """Probe a northbound agent dispatch proxy using the sample caller key in Secret Manager."""
+    token = get_access_token()
+    secret_url = (
+        f"https://secretmanager.googleapis.com/v1/projects/{args.project}/secrets/"
+        f"{urllib.parse.quote(args.secret_id, safe='')}/versions/latest:access"
+    )
+    st, sec_resp = api_get(secret_url, token, allow_404=True)
+    if st == 404 or not (sec_resp.get("payload") or {}).get("data"):
+        out = {
+            "secret_id": args.secret_id,
+            "secret_present": False,
+            "passed": False,
+            "errors": [
+                f"Secret '{args.secret_id}' has no accessible latest ENABLED version "
+                "(activate registry/available/northbound/sample-caller.yaml and run the pipeline)."
+            ],
+        }
+        print(json.dumps(out, indent=2))
+        return 1
+
+    nb_key = base64.b64decode(sec_resp["payload"]["data"]).decode("utf-8").strip()
+    key_sha256 = hashlib.sha256(nb_key.encode("utf-8")).hexdigest()[:12]
+    connect_host = args.connect_host or args.gateway_fqdn
+
+    card_resp = _https_request_with_key(
+        gateway_fqdn=args.gateway_fqdn,
+        connect_host=connect_host,
+        connect_port=args.connect_port,
+        ca_file=args.ca_file,
+        method="GET",
+        path=args.card_path,
+        api_key=nb_key,
+        timeout=30.0,
+    )
+    invoke_headers = {"X-Data-Classification": "sovereign"}
+    if args.traceparent:
+        invoke_headers["traceparent"] = args.traceparent
+    invoke_resp = _https_request_with_key(
+        gateway_fqdn=args.gateway_fqdn,
+        connect_host=connect_host,
+        connect_port=args.connect_port,
+        ca_file=args.ca_file,
+        method="POST",
+        path=args.invoke_path,
+        api_key=nb_key,
+        body_obj={
+            "prompt": "Summarize SYN-POL-001 in one short sentence.",
+            "policy_category": "residency",
+            "enforce_a2a_delegation": False,
+        },
+        extra_headers=invoke_headers,
+        timeout=120.0,
+    )
+
+    errors: list[str] = []
+    card_body = card_resp.get("body") if isinstance(card_resp.get("body"), dict) else {}
+    if card_resp.get("status") != 200 or not card_body.get("name"):
+        errors.append(
+            f"GET {args.card_path} expected HTTP 200 with Agent Card name, "
+            f"got HTTP {card_resp.get('status')} (error={card_resp.get('error')})"
+        )
+
+    inv_body = (
+        invoke_resp.get("body") if isinstance(invoke_resp.get("body"), dict) else {}
+    )
+    if invoke_resp.get("status") != 200 or inv_body.get("llm_backend") != "local-vllm":
+        errors.append(
+            f"POST {args.invoke_path} expected HTTP 200 with llm_backend=local-vllm, "
+            f"got HTTP {invoke_resp.get('status')} backend={inv_body.get('llm_backend')} "
+            f"(error={invoke_resp.get('error')})"
+        )
+
+    out = {
+        "secret_id": args.secret_id,
+        "secret_present": True,
+        "key_sha256": key_sha256,
+        "card_path": args.card_path,
+        "card_status": card_resp.get("status"),
+        "card_name": card_body.get("name"),
+        "invoke_path": args.invoke_path,
+        "invoke_status": invoke_resp.get("status"),
+        "llm_backend": inv_body.get("llm_backend"),
+        "model": inv_body.get("model"),
+        "passed": len(errors) == 0,
+        "errors": errors,
+    }
+    print(json.dumps(out, indent=2))
+    return 0 if not errors else 1
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Read-only control-plane and Cloud Trace verifier for Hybrid Cloud AI Agents."
@@ -784,6 +933,23 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_rotate.add_argument("--grace-seconds", type=int, default=-1)
     p_rotate.set_defaults(func=cmd_rotate_probe)
+
+    p_nb = sub.add_parser(
+        "northbound-probe",
+        help="Verify positive external northbound call via Apigee dispatch proxy using sample caller key.",
+    )
+    p_nb.add_argument("--project", required=True)
+    p_nb.add_argument("--secret-id", default="apigee-northbound-sample-caller-api-key")
+    p_nb.add_argument("--gateway-fqdn", default="api.hybrid-agents.internal")
+    p_nb.add_argument("--connect-host", default="")
+    p_nb.add_argument("--connect-port", type=int, default=443)
+    p_nb.add_argument("--ca-file", required=True)
+    p_nb.add_argument(
+        "--card-path", default="/agents/ops-orchestrator/.well-known/agent-card.json"
+    )
+    p_nb.add_argument("--invoke-path", default="/agents/ops-orchestrator/invoke")
+    p_nb.add_argument("--traceparent", default="")
+    p_nb.set_defaults(func=cmd_northbound_probe)
 
     return parser
 
