@@ -78,6 +78,7 @@ fi
   "${FLEET_ENV_DIR}" \
   "${TAG_NAME}" << 'EOF'
 import ast
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -552,6 +553,9 @@ if fleet_env_dir.is_dir():
   expected_variants = ("agents-platform", "gateway-tools-platform", "agents")
   variant_objects: dict[str, set[tuple[str, str, str, str]]] = {}
   rendered_agent_deployments: dict[str, dict] = {}
+  mcp_es_spec: dict | None = None
+  mcp_dep_doc: dict | None = None
+  mcp_configmaps: dict[str, dict] = {}
 
   for variant in expected_variants:
     manifest_path = fleet_env_dir / variant / "manifests.yaml"
@@ -591,7 +595,61 @@ if fleet_env_dir.is_dir():
         labels = meta.get("labels") or {}
         if kind == "Deployment" and labels.get("registry.gke.io/functional-type") == "AGENT":
           rendered_agent_deployments[name] = doc
+      elif variant == "gateway-tools-platform" and ns == "mcp-tools":
+        if kind == "ExternalSecret" and name == "pgvector-db-creds":
+          mcp_es_spec = doc.get("spec") or {}
+        elif kind == "Deployment" and name == "mcp-toolbox":
+          mcp_dep_doc = doc
+        elif kind == "ConfigMap" and name:
+          mcp_configmaps[name] = doc.get("data") or {}
     variant_objects[variant] = objects
+
+  if "gateway-tools-platform" in variant_objects:
+    if mcp_es_spec is None:
+      errors.append(
+          "fleet-package/environments/gateway-tools-platform/manifests.yaml: "
+          "missing ExternalSecret/pgvector-db-creds in namespace mcp-tools"
+      )
+    elif mcp_dep_doc is None:
+      errors.append(
+          "fleet-package/environments/gateway-tools-platform/manifests.yaml: "
+          "missing Deployment/mcp-toolbox in namespace mcp-tools"
+      )
+    else:
+      mcp_template = (mcp_es_spec.get("target") or {}).get("template")
+      if not isinstance(mcp_template, dict) or not mcp_template:
+        errors.append(
+            "fleet-package/environments/gateway-tools-platform/manifests.yaml: "
+            "ExternalSecret/pgvector-db-creds is missing spec.target.template"
+        )
+      else:
+        mcp_cfg = {
+            "configMaps": mcp_configmaps,
+            "externalSecretData": mcp_es_spec.get("data") or [],
+            "externalSecretTemplate": mcp_template,
+        }
+        expected_mcp_sha = hashlib.sha256(
+            json.dumps(mcp_cfg, sort_keys=True, separators=(",", ":")).encode(
+                "utf-8"
+            )
+        ).hexdigest()[:12]
+        mcp_pod_annotations = (
+            ((mcp_dep_doc.get("spec") or {}).get("template") or {})
+            .get("metadata")
+            or {}
+        ).get("annotations") or {}
+        actual_mcp_sha = mcp_pod_annotations.get(
+            "mcp-toolbox.hybrid-agents.internal/config-sha256"
+        )
+        if not isinstance(actual_mcp_sha, str) or actual_mcp_sha != expected_mcp_sha:
+          errors.append(
+              "fleet-package/environments/gateway-tools-platform/manifests.yaml: "
+              "Deployment/mcp-toolbox pod annotation "
+              "mcp-toolbox.hybrid-agents.internal/config-sha256 "
+              f"({actual_mcp_sha!r}) does not match ExternalSecret/pgvector-db-creds "
+              f"template SHA-256 ('{expected_mcp_sha}') "
+              "(re-run fleet-package/render.sh gateway-tools-platform)"
+          )
 
   # Check rendered agents bundle matches active registry/agents/*
   expected_active_names = set(active_agent_specs.keys())

@@ -231,6 +231,8 @@ spec:
       app.kubernetes.io/name: mcp-toolbox
   template:
     metadata:
+      annotations:
+        mcp-toolbox.hybrid-agents.internal/config-sha256: "ffe1ad5459b8"
       labels:
         app.kubernetes.io/component: mcp-toolbox
         app.kubernetes.io/name: mcp-toolbox
@@ -333,7 +335,7 @@ spec:
   template:
     metadata:
       annotations:
-        otel.hybrid-agents.internal/config-sha256: d0debca60de5
+        otel.hybrid-agents.internal/config-sha256: "d0debca60de5"
       labels:
         app.kubernetes.io/component: otel-collector
         app.kubernetes.io/name: otel-collector

@@ -964,11 +964,15 @@ EOF
     kubectl kustomize "${OVERLAY_DIR}"
   } > "${TMP_FILE}"
 
-  # Stamp deterministic SHA-256 of ConfigMap/otel-collector-config data.config.yaml
-  # onto Deployment/otel-collector pod template annotations so ConfigMap changes
-  # trigger an automatic Kubernetes rolling restart without manual rollout restart.
+  # Stamp deterministic SHA-256 config hashes onto pod template annotations:
+  # - Deployment/otel-collector from ConfigMap/otel-collector-config data.config.yaml
+  # - Deployment/mcp-toolbox from ExternalSecret/pgvector-db-creds (spec.data +
+  #   spec.target.template) plus any ConfigMaps in mcp-tools
+  # so Git-driven config or template changes trigger an automatic Kubernetes
+  # rolling restart without a manual rollout restart.
   "${PYTHON_BIN}" - "${TMP_FILE}" << 'EOF'
 import hashlib
+import json
 import os
 from pathlib import Path
 import re
@@ -991,28 +995,70 @@ except Exception:
 p = Path(sys.argv[1])
 raw = p.read_text(encoding="utf-8")
 config_yaml = None
+mcp_es_spec = None
+mcp_configmaps: dict[str, dict] = {}
 for doc in load_all(raw):
   if not isinstance(doc, dict):
     continue
   meta = doc.get("metadata") or {}
+  kind = doc.get("kind")
+  name = meta.get("name")
+  ns = meta.get("namespace")
   if (
-      doc.get("kind") == "ConfigMap"
-      and meta.get("name") == "otel-collector-config"
-      and meta.get("namespace") == "otel-system"
+      kind == "ConfigMap"
+      and name == "otel-collector-config"
+      and ns == "otel-system"
   ):
     config_yaml = (doc.get("data") or {}).get("config.yaml")
-    break
+  elif (
+      kind == "ExternalSecret"
+      and name == "pgvector-db-creds"
+      and ns == "mcp-tools"
+  ):
+    mcp_es_spec = doc.get("spec") or {}
+  elif kind == "ConfigMap" and ns == "mcp-tools" and name:
+    mcp_configmaps[str(name)] = doc.get("data") or {}
+
+updated = raw
+changed = False
 
 if config_yaml is not None:
   cfg_sha = hashlib.sha256(str(config_yaml).encode("utf-8")).hexdigest()[:12]
   marker = "otel.hybrid-agents.internal/config-sha256:"
-  count = raw.count(marker)
+  count = updated.count(marker)
   if count != 1:
     raise RuntimeError(
         f"Expected 1 {marker} annotation in {p}, found {count}"
     )
   pattern = r"(otel\.hybrid-agents\.internal/config-sha256:\s*)[^\n]+"
-  updated = re.sub(pattern, rf"\g<1>{cfg_sha}", raw, count=1)
+  updated = re.sub(pattern, rf'\g<1>"{cfg_sha}"', updated, count=1)
+  changed = True
+
+if mcp_es_spec is not None:
+  target_template = (mcp_es_spec.get("target") or {}).get("template")
+  if not isinstance(target_template, dict) or not target_template:
+    raise RuntimeError(
+        f"ExternalSecret/pgvector-db-creds in {p} is missing spec.target.template"
+    )
+  mcp_cfg = {
+      "configMaps": mcp_configmaps,
+      "externalSecretData": mcp_es_spec.get("data") or [],
+      "externalSecretTemplate": target_template,
+  }
+  mcp_sha = hashlib.sha256(
+      json.dumps(mcp_cfg, sort_keys=True, separators=(",", ":")).encode("utf-8")
+  ).hexdigest()[:12]
+  marker = "mcp-toolbox.hybrid-agents.internal/config-sha256:"
+  count = updated.count(marker)
+  if count != 1:
+    raise RuntimeError(
+        f"Expected 1 {marker} annotation in {p}, found {count}"
+    )
+  pattern = r"(mcp-toolbox\.hybrid-agents\.internal/config-sha256:\s*)[^\n]+"
+  updated = re.sub(pattern, rf'\g<1>"{mcp_sha}"', updated, count=1)
+  changed = True
+
+if changed:
   p.write_text(updated, encoding="utf-8")
 EOF
 

@@ -199,6 +199,8 @@ spec:
       app.kubernetes.io/name: mcp-toolbox
   template:
     metadata:
+      annotations:
+        mcp-toolbox.hybrid-agents.internal/config-sha256: rendered-by-render-sh
       labels:
         app.kubernetes.io/component: mcp-toolbox
         app.kubernetes.io/name: mcp-toolbox
